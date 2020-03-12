@@ -9,7 +9,6 @@ import subprocess
 import argparse
 import time
 
-ledger_index = 0
 
 async def coro():
     async with websockets.connect("ws://127.0.0.1:6006", ping_interval=5, ping_timeout=3) as websocket:
@@ -36,6 +35,112 @@ async def coro():
                     print(json.loads(await websocket3.recv()))
 
                 print("*****************")
+
+
+async def get_subscribe(txIp, txPort, reportingIp, reportingPort):
+    #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
+    txAddress = 'wss://s.altnet.rippletest.net/'
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    print("connecting to reporting")
+    async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
+        print("connected to reporting")
+        ready = False
+        seq = 0
+        # wait for the reporting process to be available. It may be in the
+        # middle of loading the database
+        while not ready:
+            await reportingWs.send(json.dumps({'command':'server_info'}))
+            res = json.loads(await reportingWs.recv())
+            if 'result' in res and 'validated_ledger' in res['result']['info']:
+                seq = res['result']['info']['validated_ledger']['seq']
+                ready = True
+
+        seq = seq + 1
+        print("Seq is = " + str(seq))
+        print("Connecting to tx")
+        async with websockets.connect(txAddress, ping_interval=5, ping_timeout=3) as txSubWs:
+            print("connected to tx")
+
+
+            await txSubWs.send(json.dumps({'command':'subscribe', 'streams':['ledger']}))
+
+
+            res = json.loads(await txSubWs.recv())['result']
+            print(res)
+            async with websockets.connect(txAddress, ping_interval=5, ping_timeout=3) as txWs:
+                while True:
+                    res = json.loads(await txSubWs.recv())
+                    ledger_index = res['ledger_index']
+                    close_time = res['ledger_time']
+                    while seq <= ledger_index:
+
+
+                        await txWs.send(json.dumps({"command":"ledger","ledger_index":seq, 'transactions': True, 'expand': True, 'binary':True}))
+                    # get ledgers in increasing order. If ledger is not available, sleep
+                    # for two seconds and try again
+                        res = json.loads(await txWs.recv())
+                        if 'error' in res or res['result']['validated'] == False:
+                            print("Ledger not yet validated. Sleeping...")
+                            #await asyncio.sleep(2)
+                            continue
+                        else:
+                            print('Ledger ' + str(seq) + 'validated. Importing...')
+
+                        print("***")
+                        print(res)
+                        print("***")
+                        lgr = res['result']
+                        print(lgr)
+                        transactions = lgr['ledger']['transactions']
+
+                        # submit each transaction to reporting
+                        for t in transactions:
+                            await reportingWs.send(json.dumps({"command":"submit",'tx_blob':t['tx_blob']}))
+                            res = json.loads(await reportingWs.recv())
+                            print(res)
+                            result = res['result']
+                            print(result['tx_json']['hash'])
+                            print('engine_result = '
+                                    + result['engine_result']
+                                    + " . engine_result_message = "
+                                    + result['engine_result_message'])
+
+                        # close the ledger
+                        await reportingWs.send(json.dumps({"command":"ledger_accept", 'close_time':close_time, "ledger_index":seq}))
+                        print(json.loads(await reportingWs.recv()))
+                        await reportingWs.send(json.dumps({'command':'ledger', 'ledger_index':seq}))
+                        reportingLgr = json.loads(await reportingWs.recv())['result']
+
+                        if lgr['ledger_hash'] != reportingLgr['ledger_hash']:
+                            print("ledger hash mismatch! aborting")
+                            print(reportingLgr)
+                            print("*****")
+                            print(lgr)
+                            return
+                        else:
+                            print("Successfully imported ledger! Seq = " + str(seq))
+                        seq = seq + 1
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 async def get_increasing(txIp, txPort, reportingIp, reportingPort):
     #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
@@ -107,6 +212,51 @@ async def get_increasing(txIp, txPort, reportingIp, reportingPort):
                 seq = seq + 1
 
 
+async def load_ledger(txIp, txPort, reportingIp, reportingPort):
+    #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
+    txAddress = 'wss://s.altnet.rippletest.net/'
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    print("connecting to reporting")
+
+    async with websockets.connect(txAddress, ping_interval=5, ping_timeout=3) as txWs:
+
+        await txWs.send(json.dumps({"command":"ledger","ledger":"validated"}))
+        res = json.loads(await txWs.recv())['result']['ledger']
+        print(res)
+        async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
+            await reportingWs.send(json.dumps({"command": "ledger_accept","ledger":res}))
+            res = json.loads(await reportingWs.recv());
+            print(res)
+
+async def load_data(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
+
+    #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
+    txAddress = 'wss://s.altnet.rippletest.net/'
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    print("connecting to reporting")
+
+    async with websockets.connect(txAddress, ping_interval=5, ping_timeout=3) as txWs:
+
+        await txWs.send(json.dumps({"command":"ledger_data","ledger_index":int(ledgerSeq), "binary": True}))
+        result = json.loads(await txWs.recv())
+        print(result)
+        res = result['result']
+        async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
+            for data in res['state']:
+                await reportingWs.send(json.dumps({"command": "ledger_accept","ledger_data":"","data":data['data'],"index":data['index']}))
+                json.loads(await reportingWs.recv())
+
+
+
+
+async def finish(txIp, txPort, reportingIp, reportingPort):
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    print("connecting to reporting")
+    async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
+        await reportingWs.send(json.dumps({"command": "ledger_accept","finish":True}))
+        res = json.loads(await reportingWs.recv());
+        print(res)
+
 
 
 async def wait_until_synced(ip, port):
@@ -172,7 +322,7 @@ def start_in_daemon(buildDir, conf):
     #os.system('cd -')
 
 parser = argparse.ArgumentParser(description='ETL script for transactions')
-parser.add_argument('action', choices=['sync','etl','restart','all'])
+parser.add_argument('action', choices=['sync','etl','sub','restart','load','data','finish','all'])
 parser.add_argument('--buildDir', default='~/Code/rippled/build')
 parser.add_argument('--reportingIp', default='127.0.0.1')
 parser.add_argument('--reportingPort', default='6007')
@@ -180,6 +330,7 @@ parser.add_argument('--txIp', default='127.0.0.1')
 parser.add_argument('--txPort', default='6006')
 parser.add_argument('--confReporting', default='~/.config/ripple/rippled2.cfg')
 parser.add_argument('--confTx', default='~/.config/ripple/rippled.cfg')
+parser.add_argument('--ledgerSeq')
 
 
 args = parser.parse_args()
@@ -199,11 +350,19 @@ def run(args):
         while True:
             try:
                 asyncio.get_event_loop().run_until_complete(get_increasing(args.txIp, args.txPort, args.reportingIp, args.reportingPort))
+                break
             except websockets.exceptions.ConnectionClosedError as e:
                 print("Connection closed. Sleeping...")
                 time.sleep(20)
                 print("Trying again")
-
+    elif args.action == 'sub':
+        asyncio.get_event_loop().run_until_complete(get_subscribe(args.txIp, args.txPort, args.reportingIp, args.reportingPort))
+    elif args.action == 'load':
+        asyncio.get_event_loop().run_until_complete(load_ledger(args.txIp, args.txPort, args.reportingIp, args.reportingPort))
+    elif args.action == 'data':
+        asyncio.get_event_loop().run_until_complete(load_data(args.txIp, args.txPort, args.reportingIp, args.reportingPort, args.ledgerSeq))
+    elif args.action == 'finish':
+        asyncio.get_event_loop().run_until_complete(finish(args.txIp, args.txPort, args.reportingIp, args.reportingPort))
     elif args.action == 'all':
         # shutdown all rippleds
         os.system('pkill rippled')
