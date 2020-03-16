@@ -143,8 +143,11 @@ async def get_subscribe(txIp, txPort, reportingIp, reportingPort):
 
 
 async def get_increasing(txIp, txPort, reportingIp, reportingPort):
-    #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
-    txAddress = 'wss://s.altnet.rippletest.net/'
+    txAddress = None
+    if txPort is None or txIp is None:
+        txAddress = 'wss://s.altnet.rippletest.net/'
+    else:
+        txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
     reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
     print("connecting to reporting")
     async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
@@ -172,7 +175,7 @@ async def get_increasing(txIp, txPort, reportingIp, reportingPort):
                 res = json.loads(await txWs.recv())
                 if 'error' in res or res['result']['validated'] == False:
                     print("Ledger not yet validated. Sleeping...")
-                    #await asyncio.sleep(2)
+                    await asyncio.sleep(2)
                     continue
                 else:
                     print('Ledger ' + str(seq) + 'validated. Importing...')
@@ -181,6 +184,7 @@ async def get_increasing(txIp, txPort, reportingIp, reportingPort):
 
                 await txWs.send(json.dumps({"command":"ledger","ledger_index":seq, 'transactions': True, 'expand': True, 'binary':True}))
                 res = json.loads(await txWs.recv())
+                print(res)
                 lgr = res['result']
                 transactions = lgr['ledger']['transactions']
                 # submit each transaction to reporting
@@ -214,7 +218,12 @@ async def get_increasing(txIp, txPort, reportingIp, reportingPort):
 
 async def load_ledger(txIp, txPort, reportingIp, reportingPort):
     #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
-    txAddress = 'wss://s.altnet.rippletest.net/'
+
+    txAddress = None
+    if txPort is None or txIp is None:
+        txAddress = 'wss://s.altnet.rippletest.net/'
+    else:
+        txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
     reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
     print("connecting to reporting")
 
@@ -229,9 +238,11 @@ async def load_ledger(txIp, txPort, reportingIp, reportingPort):
             print(res)
 
 async def load_data(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
-
-    #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
-    txAddress = 'wss://s.altnet.rippletest.net/'
+    txAddress = None
+    if txPort is None or txIp is None:
+        txAddress = 'wss://s.altnet.rippletest.net/'
+    else:
+        txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
     reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
     print("connecting to reporting")
 
@@ -240,7 +251,7 @@ async def load_data(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
     while not done:
         try:
             async with websockets.connect(txAddress, ping_interval=5, ping_timeout=3) as txWs:
-                while True:
+                while not done:
                     if marker is None:
                         print("sending without marker")
                         await txWs.send(json.dumps({"command":"ledger_data","ledger_index":int(ledgerSeq), "binary": True}))
@@ -255,10 +266,10 @@ async def load_data(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
                         print("Done downloading data")
                         marker = None
                         done = True
-                        break
                     print(marker)
                     async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
                         for data in res['state']:
+                            print(data)
                             await reportingWs.send(json.dumps({"command": "ledger_accept","ledger_data":"","data":data['data'],"index":data['index']}))
                             json.loads(await reportingWs.recv())
         except websockets.exceptions.ConnectionClosedError as e:
@@ -352,7 +363,7 @@ parser.add_argument('--buildDir', default='~/Code/rippled/build')
 parser.add_argument('--reportingIp', default='127.0.0.1')
 parser.add_argument('--reportingPort', default='6007')
 parser.add_argument('--txIp', default='127.0.0.1')
-parser.add_argument('--txPort', default='6006')
+parser.add_argument('--txPort')
 parser.add_argument('--confReporting', default='~/.config/ripple/rippled2.cfg')
 parser.add_argument('--confTx', default='~/.config/ripple/rippled.cfg')
 parser.add_argument('--ledgerSeq')
