@@ -216,6 +216,25 @@ async def get_increasing(txIp, txPort, reportingIp, reportingPort):
                 seq = seq + 1
 
 
+async def load_txs(txIp, txPort, reportingIp, reportingPort, seq):
+    txAddress = None
+    if txPort is None or txIp is None:
+        txAddress = 'wss://s.altnet.rippletest.net/'
+    else:
+        txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    print("connecting to reporting")
+    async with websockets.connect(txAddress, ping_interval=5, ping_timeout=3) as txWs:
+        await txWs.send(json.dumps({"command":"ledger","ledger_index":int(seq), 'transactions': True, 'expand': True, 'binary':True}))
+        txs = json.loads(await txWs.recv())['result']['ledger']['transactions']
+        print(txs)
+        async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
+            await reportingWs.send(json.dumps({"command": "ledger_accept",
+                "load_meta": True, "transactions": txs}))
+            res = json.loads(await reportingWs.recv());
+            print(res)
+
+
 async def load_ledger(txIp, txPort, reportingIp, reportingPort):
     #txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
 
@@ -232,8 +251,17 @@ async def load_ledger(txIp, txPort, reportingIp, reportingPort):
         await txWs.send(json.dumps({"command":"ledger","ledger":"validated"}))
         res = json.loads(await txWs.recv())['result']['ledger']
         print(res)
+        seq = res['ledger_index']
+        
+        await txWs.send(json.dumps({"command":"ledger","ledger_index":int(seq), 'transactions': True, 'expand': True, 'binary':True}))
+        txs = json.loads(await txWs.recv())['result']['ledger']['transactions']
+        print(txs)
         async with websockets.connect(reportingAddress, ping_interval=5, ping_timeout=3) as reportingWs:
             await reportingWs.send(json.dumps({"command": "ledger_accept","ledger":res}))
+            res = json.loads(await reportingWs.recv());
+            print(res)
+            await reportingWs.send(json.dumps({"command": "ledger_accept",
+                "load_txns": True, "transactions": txs}))
             res = json.loads(await reportingWs.recv());
             print(res)
 
@@ -358,7 +386,7 @@ def start_in_daemon(buildDir, conf):
     #os.system('cd -')
 
 parser = argparse.ArgumentParser(description='ETL script for transactions')
-parser.add_argument('action', choices=['sync','accept','etl','sub','restart','load','data','finish','all'])
+parser.add_argument('action', choices=['sync','accept','etl','sub','restart','load','data','finish','txs','all'])
 parser.add_argument('--buildDir', default='~/Code/rippled/build')
 parser.add_argument('--reportingIp', default='127.0.0.1')
 parser.add_argument('--reportingPort', default='6007')
@@ -398,6 +426,8 @@ def run(args):
         asyncio.get_event_loop().run_until_complete(load_ledger(args.txIp, args.txPort, args.reportingIp, args.reportingPort))
     elif args.action == 'data':
         asyncio.get_event_loop().run_until_complete(load_data(args.txIp, args.txPort, args.reportingIp, args.reportingPort, args.ledgerSeq))
+    elif args.action == 'txs':
+        asyncio.get_event_loop().run_until_complete(load_txs(args.txIp, args.txPort, args.reportingIp, args.reportingPort, args.ledgerSeq))
     elif args.action == 'finish':
         asyncio.get_event_loop().run_until_complete(finish(args.txIp, args.txPort, args.reportingIp, args.reportingPort))
     elif args.action == 'accept':
