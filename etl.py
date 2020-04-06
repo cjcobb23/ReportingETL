@@ -234,6 +234,213 @@ async def load_txs(txIp, txPort, reportingIp, reportingPort, seq):
             res = json.loads(await reportingWs.recv());
             print(res)
 
+## Execute a function that requires a websocket
+async def wrap(address, func):
+    while True:
+        try:
+            async with websockets.connect(address) as ws:
+                return await func(ws)
+        except websockets.exceptions.ConnectionClosedError as e:
+            print("Websocket closed. Address = " + address)
+            await asyncio.sleep(1)
+
+
+
+
+async def load_ledger_simple(txAddress, reportingAddress, ledgerSeq):
+
+    ledgerHeader = None
+    async def getLedgerHeader(txWs):
+        nonlocal ledgerSeq
+        nonlocal ledgerHeader
+        if ledgerSeq is None:
+            ledgerSeq = "validated"
+        else:
+            ledgerSeq = int(ledgerSeq)
+        while True:
+            print("Getting ledger header from tx")
+            await txWs.send(json.dumps({"command":"ledger","ledger_index":ledgerSeq}))
+            payload = json.loads(await txWs.recv())
+            if 'error' in payload or not payload['result']['validated']:
+                print("waiting for ledger : " + str(ledgerSeq))
+                await asyncio.sleep(2)
+                continue
+            print("Got ledger header from tx")
+            print(payload)
+            ledgerHeader = payload['result']['ledger']
+            ledgerSeq = int(ledgerHeader['ledger_index'])
+            break
+
+    await wrap(txAddress, getLedgerHeader)
+
+
+    print("Sending ledger header to reporting")
+
+    async def sendLedgerHeader(reportingWs):
+        nonlocal ledgerHeader
+        await reportingWs.send(json.dumps({"command": "ledger_accept","ledger":ledgerHeader}))
+        payload = json.loads(await reportingWs.recv())
+        print(payload)
+
+    await wrap(reportingAddress, sendLedgerHeader)
+
+    print("Getting txns from tx")
+    txs = None
+    async def getTxns(txWs):
+        nonlocal ledgerSeq
+        nonlocal txs
+        await txWs.send(json.dumps({"command":"ledger","ledger_index":ledgerSeq,
+            'transactions': True, 'expand': True, 'binary':True}))
+        payload = json.loads(await txWs.recv())
+        txs = payload['result']['ledger']['transactions']
+
+    await wrap(txAddress, getTxns)
+
+    async def sendTxns(reportingWs):
+        nonlocal txs
+        await reportingWs.send(json.dumps({"command":"ledger_accept", "load_txns":True,
+            "transactions": txs}))
+        payload = json.loads(await reportingWs.recv())
+        print(payload)
+
+    await wrap(reportingAddress, sendTxns)
+    return int(ledgerSeq)
+
+
+async def load_data_simple(txAddress, reportingAddress, ledgerSeq):
+    marker = None
+    done = False
+    jsonArgs = {"command":"ledger_data","ledger_index":ledgerSeq, "binary": True}
+
+    while not done:
+        if marker is not None:
+            jsonArgs['marker'] = marker
+        payload = None
+
+        async def getData(txWs):
+            nonlocal jsonArgs
+            await txWs.send(json.dumps(jsonArgs))
+            return json.loads(await txWs.recv())
+
+        payload = await wrap(txAddress, getData)
+        if 'marker' in payload['result']:
+            marker = payload['result']['marker']
+        else:
+            print("Done downloading data")
+            marker = None
+            done = True
+        state = payload['result']['state']
+
+        async def sendData(reportingWs):
+            nonlocal state
+            print("sending data to reporting")
+            await reportingWs.send(json.dumps({"command": "ledger_accept",
+                "ledger_data":True,"state":state}))
+            await reportingWs.recv()
+        await wrap(reportingAddress, sendData)
+
+
+async def finish_simple(reportingAddress, ledgerSeq):
+    async def wrapped(reportingWs):
+        await reportingWs.send(json.dumps({"command": "ledger_accept",
+            "finish":True, "ledger_index":ledgerSeq}))
+        return json.loads(await reportingWs.recv());
+
+    return await wrap(reportingAddress, wrapped)
+
+async def setup_simple(txIp,txPort, reportingIp, reportingPort, ledgerSeq):
+    txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    ledgerSeq = await load_ledger_simple(txAddress, reportingAddress, ledgerSeq)
+    await load_data_simple(txAddress, reportingAddress, ledgerSeq)
+    res = await finish_simple(reportingAddress, ledgerSeq)
+    print(res)
+    if res['result']['account_hash'] == 'correct' and res['result']['tx_hash'] == 'correct':
+        print("Correctly loaded ledger = " + str(ledgerSeq))
+        return ledgerSeq
+    else:
+        print("mismatch at ledger = " + str(ledgerSeq))
+        return None
+
+    
+
+async def update_simple(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
+    txAddress = 'ws://' + str(txIp) + ':' + str(txPort)
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    ledgerSeq = int(ledgerSeq)
+    while True:
+        await load_ledger_simple(txAddress, reportingAddress, ledgerSeq)
+        await load_diff_simple(txAddress, reportingAddress, ledgerSeq)
+        res = await finish_simple(reportingAddress, ledgerSeq)
+        if res['result']['account_hash'] == 'correct' and res['result']['tx_hash'] == 'correct':
+            print("Correctly loaded ledger = " + str(ledgerSeq))
+            ledgerSeq = ledgerSeq + 1
+        else:
+            print("mismatch at ledger = " + str(ledgerSeq))
+            break
+
+
+async def do_all_simple(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
+    ledgerSeq = await setup_simple(txIp, txPort, reportingIp, reportingPort, ledgerSeq)
+    if ledgerSeq is not None:
+        await update_simple(txIp, txPort, reportingIp, reportingPort, ledgerSeq+1)
+    else:
+        print("Failed to load initial ledger")
+
+
+
+async def load_diff_simple(txAddress, reportingAddress, ledgerSeq):
+    print("getting metadata")
+    async def getMeta(txWs):
+        nonlocal ledgerSeq
+        await txWs.send(json.dumps(
+            {"command":"ledger",
+                "ledger_index": ledgerSeq,
+                'transactions': True, 'expand': True}))
+        return json.loads(await txWs.recv())
+
+    payload = await wrap(txAddress, getMeta)
+
+    print("Processing metadata")
+    objs = set()
+    for tx in payload['result']['ledger']['transactions']:
+        meta = tx['metaData']
+        for node in meta['AffectedNodes']:
+            idx = None
+            if 'ModifiedNode' in node:
+                idx = node['ModifiedNode']['LedgerIndex']
+            elif 'CreatedNode' in node:
+                idx = node['CreatedNode']['LedgerIndex']
+            else:
+                idx = node['DeletedNode']['LedgerIndex']
+            objs.add(idx)
+
+    print("Getting ledger objects")
+    objsJson = []
+    for idx in objs:
+        async def getObjs(txWs):
+            await txWs.send(json.dumps({"command":"ledger_entry","index":idx,
+                "binary":True, "ledger_index":ledgerSeq}))
+            return json.loads(await txWs.recv())
+        res = await wrap(txAddress, getObjs)
+        if 'error' in res:
+            assert(res['error'] == 'entryNotFound')
+            objsJson.append({"index":idx})
+        else:
+            objsJson.append({"index":idx,"node_binary":res['result']['node_binary']})
+
+
+    print("Sending ledger objects")
+    async def sendObjs(reportingWs):
+        await reportingWs.send(json.dumps({"command": "ledger_accept",
+            "load_diff": True, "objs":objsJson}))
+        return json.loads(await reportingWs.recv());
+
+    await wrap(reportingAddress, sendObjs)
+
+
+    
+
 
 
 
@@ -282,11 +489,16 @@ async def load_diff(txIp, txPort, reportingIp, reportingPort, ledgerIndex):
                 objsJson.append({"index":idx,"node_binary":res['result']['node_binary']})
         print(objsJson)
 
-        async with websockets.connect(reportingAddress) as reportingWs:
-            await reportingWs.send(json.dumps({"command": "ledger_accept",
-                "load_diff": True, "objs":objsJson}))
-            res = json.loads(await reportingWs.recv());
-            print(res['result']['msg'])
+        while True:
+            try:
+                async with websockets.connect(reportingAddress) as reportingWs:
+                    await reportingWs.send(json.dumps({"command": "ledger_accept",
+                        "load_diff": True, "objs":objsJson}))
+                    res = json.loads(await reportingWs.recv());
+                    print(res['result']['msg'])
+                    break
+            except websockets.exceptions.ConnectionClosedError as e:
+                print("connection closed sending diff, trying again")
 
 async def load_with_data(txIp, txPort, reportingIp, reportingPort, seq):
     while True:
@@ -295,6 +507,9 @@ async def load_with_data(txIp, txPort, reportingIp, reportingPort, seq):
         res = await finish(txIp, txPort, reportingIp, reportingPort)
         if res['result']['account_hash'] == 'correct' and res['result']['tx_hash'] == 'correct':
             print("successfuly loaded ledger = " + str(seq))
+            seq = seq + 1
+        elif res['result']['msg'] == "already_finished":
+            print("already finished that ledger")
             seq = seq + 1
         else:
             print("Failed to load ledger = " + str(seq))
@@ -353,15 +568,22 @@ async def load_ledger(txIp, txPort, reportingIp, reportingPort, seq):
                 txs = payload['result']['ledger']['transactions']
                 break
 
-        async with websockets.connect(reportingAddress) as reportingWs:
-            await reportingWs.send(json.dumps({"command": "ledger_accept","ledger":res}))
-            res = json.loads(await reportingWs.recv());
-            print(res)
-            await reportingWs.send(json.dumps({"command": "ledger_accept",
-                "load_txns": True, "transactions": txs}))
-            res = json.loads(await reportingWs.recv());
-            print(res)
-    return int(seq)
+        while True:
+            try:
+                async with websockets.connect(reportingAddress) as reportingWs:
+                    await reportingWs.send(json.dumps({"command": "ledger_accept","ledger":res}))
+                    res = json.loads(await reportingWs.recv());
+                    print(res)
+                    await reportingWs.send(json.dumps({"command": "ledger_accept",
+                        "load_txns": True, "transactions": txs}))
+                    res = json.loads(await reportingWs.recv());
+                    print(res)
+                    return int(seq)
+                    break
+            except websockets.exceptions.ConnectionClosedError as e:
+                print("connection closed on load_ledger, trying again")
+
+
 
 
 
@@ -461,11 +683,16 @@ async def load_data(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
 async def finish(txIp, txPort, reportingIp, reportingPort):
     reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
     print("connecting to reporting")
-    async with websockets.connect(reportingAddress) as reportingWs:
-        await reportingWs.send(json.dumps({"command": "ledger_accept","finish":True}))
-        res = json.loads(await reportingWs.recv());
-        print(res)
-        return res
+    while True:
+        try:
+            async with websockets.connect(reportingAddress) as reportingWs:
+                await reportingWs.send(json.dumps({"command": "ledger_accept","finish":True}))
+                res = json.loads(await reportingWs.recv());
+                print(res)
+                return res
+                break
+        except websockets.exception.ConnectionClosedError as a:
+            print("closed on finish")
 
 async def accept(reportingIp, reportingPort, ledgerIndex, closeTime):
     reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
@@ -540,7 +767,7 @@ def start_in_daemon(buildDir, conf):
     #os.system('cd -')
 
 parser = argparse.ArgumentParser(description='ETL script for transactions')
-parser.add_argument('action', choices=['sync','accept','etl','sub','restart','load','data','finish','txs','diff','all','load_txs_finish',"load_diff", "go", "do_all"])
+parser.add_argument('action', choices=['sync','accept','etl','sub','restart','load','data','finish','txs','diff','all','load_txs_finish',"load_diff", "go", "do_all","do_all_simple"])
 parser.add_argument('--buildDir', default='~/Code/rippled/build')
 parser.add_argument('--reportingIp', default='127.0.0.1')
 parser.add_argument('--reportingPort', default='6007')
@@ -575,7 +802,9 @@ def run(args):
                 time.sleep(20)
                 print("Trying again")
     elif args.action == "go":
-        asyncio.get_event_loop().run_until_complete(load_with_data(args.txIp, args.txPort, args.reportingIp, args.reportingPort, args.ledgerSeq))
+        asyncio.get_event_loop().run_until_complete(update_simple(args.txIp, args.txPort, args.reportingIp, args.reportingPort, args.ledgerSeq))
+    elif args.action == "do_all_simple":
+        asyncio.get_event_loop().run_until_complete(do_all_simple(args.txIp, args.txPort, args.reportingIp, args.reportingPort, args.ledgerSeq))
     elif args.action == "do_all":
         asyncio.get_event_loop().run_until_complete(do_all(args.txIp, args.txPort, args.reportingIp, args.reportingPort, args.ledgerSeq))
     elif args.action == 'sub':
