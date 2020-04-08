@@ -111,7 +111,7 @@ async def load_data_simple(txAddress, reportingAddress, ledgerSeq):
         async def sendData(reportingWs):
             nonlocal state
             nonlocal marker
-            print("sending data to reporting. marker = " + marker)
+            print("sending data to reporting. marker = " + str(marker))
             await reportingWs.send(json.dumps({"command": "ledger_accept",
                 "ledger_data":True,"state":state}))
             await reportingWs.recv()
@@ -156,7 +156,8 @@ async def update_simple(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
         await load_ledger_simple(txAddress, reportingAddress, ledgerSeq)
         await load_diff_simple(txAddress, reportingAddress, ledgerSeq)
         res = await finish_simple(reportingAddress, ledgerSeq)
-        if res['result']['account_hash'] == 'correct' and res['result']['tx_hash'] == 'correct':
+        print(res)
+        if 'msg' in res['result'] or (res['result']['account_hash'] == 'correct' and res['result']['tx_hash'] == 'correct'):
             print("Correctly loaded ledger = " + str(ledgerSeq))
             ledgerSeq = ledgerSeq + 1
         else:
@@ -210,6 +211,8 @@ async def load_diff_simple(txAddress, reportingAddress, ledgerSeq):
             return json.loads(await txWs.recv())
         res = await wrap(txAddress, getObjs)
         if 'error' in res:
+            if res['error'] != 'entryNotFound':
+                print(res)
             assert(res['error'] == 'entryNotFound')
             objsJson.append({"index":idx})
         else:
@@ -271,9 +274,20 @@ async def diff_ledgers(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
     print("All matched!")
 
 
+async def test_grpc(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
+    
+    jsonArgs = {"command":"ledger_accept","ledger_index":int(ledgerSeq),
+            "start_grpc":True, "ip":txIp, "port":txPort}
+
+    reportingAddress = 'ws://' + str(reportingIp) + ':' + str(reportingPort)
+    async def sendGrpc(reportingWs):
+        await reportingWs.send(json.dumps(jsonArgs))
+        return json.loads(await reportingWs.recv())
+    print(await wrap(reportingAddress, sendGrpc))
+
 
 parser = argparse.ArgumentParser(description='ETL script for reporting')
-parser.add_argument('action', choices=["setup","update","do_all","diff"])
+parser.add_argument('action', choices=["setup","update","do_all","diff","grpc"])
 parser.add_argument('--reportingIp', default='127.0.0.1')
 parser.add_argument('--reportingPort')
 parser.add_argument('--txIp', default='127.0.0.1')
@@ -300,6 +314,10 @@ def run(args):
     elif args.action == 'diff_ledger':
         asyncio.get_event_loop().run_until_complete(
                 diff_ledgers(args.txIp, args.txPort, args.reportingIp,
+                    args.reportingPort, args.ledgerSeq))
+    elif args.action == "grpc":
+        asyncio.get_event_loop().run_until_complete(
+                test_grpc(args.txIp, args.txPort, args.reportingIp,
                     args.reportingPort, args.ledgerSeq))
 
 run(args)
