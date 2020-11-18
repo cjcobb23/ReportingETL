@@ -273,6 +273,10 @@ async def diff_ledgers(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
             print("Match at idx = " + str(idx)) 
     print("All matched!")
 
+async def test_synced(ip, port):
+    jsonArgs = {"command":"server_info"}
+
+
 
 async def test_grpc(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
     

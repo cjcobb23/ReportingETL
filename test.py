@@ -13,39 +13,74 @@ import threading
 
 ## Execute a function to completion. If websocket connection is closed,
 ## reestablish the connection and try again
+
 async def wrap(address, func):
     while True:
         try:
+            print("connecting")
+            print(address)
             async with websockets.connect(address) as ws:
                 return await func(ws)
         except websockets.exceptions.ConnectionClosedError as e:
+            print(e)
             print("Websocket closed. Address = " + address)
             await asyncio.sleep(1)
 
-startSequence = 0
 latestSequence = 0
 accountTransactions = {}
+die = False
 
 ## Tests that every ledger in the range is validated
-async def checkLedgers(cv, address):
+async def checkLedgers(cv, address, start, full):
+    print("starting check ledgers")
     while True:
         with cv:
             cv.wait()
-        
-        print("checking range " + str(startSequence) + " - " + str(latestSequence))
-        for s in range(startSequence, latestSequence):
+            assert(not die)
+
+            
+        async def getMinLedger(ws):
+            await ws.send(json.dumps({"command":"server_info"}))
+            res = json.loads(await ws.recv())
+
+            completeLedgers = res["result"]["info"]["complete_ledgers"]
+            return int(completeLedgers.split("-")[0])
+
+        if start is None:
+            start = await wrap(address, getMinLedger)
+        else:
+            start = int(start)
+        last = latestSequence
+        if not full:
+            start = last - 1
+        print("checking range " + str(start) + " - " + str(latestSequence))
+        for s in range(start, last):
             async def checkLedger(ws):
                 await ws.send(json.dumps({"command":"ledger","ledger_index":s, "transactions":True}))
                 res = json.loads(await ws.recv())
                 print(res)
                 assert res["status"] == "success"
-                return await checkTransactions(ws, res["result"]["ledger"]["transactions"])
+                transactions = res["result"]["ledger"]["transactions"]
+                account = None
+                for txID in transactions:
+                    await ws.send(json.dumps({"command":"tx","transaction":txID}))
+                    res = json.loads(await ws.recv())
+                    print(res)
+                    assert res["status"] == "success"
+                    account = res["result"]["Account"]
+                    await ws.send(json.dumps({"command":"account_info","account":account,"ledger_index":s}))
+                    res = json.loads(await ws.recv())
+                    print(res)
+                    assert res["status"] == "success"
+                    break
+                return True
+                #return await checkTransactions(ws, res["result"]["ledger"]["transactions"])
 
             res = await wrap(address, checkLedger)
 
             if not res:
                 quit()
-        print("successfully verified all ledgers in range " + str(startSequence) + " - " + str(latestSequence))
+        print("successfully verified all ledgers in range " + str(start) + " - " + str(last))
 
 async def checkAccountTransactions(ws, account):
     print("checkign account transactions for account = " + account)
@@ -100,37 +135,345 @@ async def checkTransactions(ws,transactions):
     return True
 
 
+async def race(ip, port):
+
+    address = 'ws://' + str(ip) + ':' + str(port)
+    try:
+        async with websockets.connect(address) as ws:
+            while True:
+                await ws.send(json.dumps({"command":"ledger","ledger_index":"validated"}))
+                payload = json.loads(await ws.recv())
+                payload = payload["result"]
+                ledgerIndex = payload["ledger_index"]
+                await ws.send(json.dumps({"command":"account_tx","account":"rJb5KsHsDHF1YS5B5DU6QCkH5NsPaKQTcy","ledger_index_min":ledgerIndex, "ledger_index_max":ledgerIndex}))
+                payload = json.loads(await ws.recv())
+                if payload["status"] != "success":
+                    print(payload)
+                    assert(False)
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(e)
 
 
-async def subscribe(ip, port):
+
+async def subscribe(ip, port, start, full, maxLag = 10, simple = False):
 
     global startSequence
     global latestSequence
+    global die
     cv = threading.Condition()
 
     address = 'ws://' + str(ip) + ':' + str(port)
+    print("Hello")
+    print(simple)
 
-    def func():
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        asyncio.get_event_loop().run_until_complete(checkLedgers(cv,address))
-    t = threading.Thread(target=func)
-    t.start()
+
+#    def func():
+#        asyncio.set_event_loop(asyncio.new_event_loop())
+#        asyncio.get_event_loop().run_until_complete(checkLedgers(cv,address,start,full))
+#    t = threading.Thread(target=func)
+#    if not simple:
+#        print("starting thread")
+#        t.start()
+
+    proposed = []
+    numLedgers = 0
     try:
         async with websockets.connect(address) as ws:
             await ws.send(json.dumps({"command":"subscribe","streams":["ledger"]}))
             while True:
+                start = int(time.time())
                 payload = json.loads(await ws.recv())
+                end = int(time.time())
+                print("Time between ledgers = " + str(end - start))
+                die = (end - start) > maxLag
                 print(payload)
+                if die:
+                    with cv:
+                        cv.notifyAll()
                 if "result" in payload:
                     payload = payload["result"]
-                if startSequence == 0:
-                    startSequence = payload["ledger_index"]
-                latestSequence = payload["ledger_index"]
-                with cv:
-                    cv.notifyAll()
+                if "validated_ledgers" in payload:
+                    validatedLedgers = payload["validated_ledgers"]
+                    if validatedLedgers != "" and validatedLedgers != "empty":
+                        start = int(validatedLedgers[0:validatedLedgers.find("-")])
+
+                if "transaction" in payload:
+                    print(payload)
+                    proposed.append(payload["transaction"]["hash"])
+                    if len(proposed) > 10000:
+                        proposed.pop()
+                elif "ledger_index" in payload:
+                    ledgerIndex = int(payload["ledger_index"])
+                    numLedgers = numLedgers + 1
+                    async def checkLedger(ws):
+                        await ws.send(json.dumps({"command":"ledger","ledger_index":ledgerIndex, "transactions":True}))
+                        res = json.loads(await ws.recv())
+                        print(res)
+                        assert res["status"] == "success"
+                        assert len(res["result"]["ledger"]["transactions"]) > 0
+                        transactions = res["result"]["ledger"]["transactions"]
+                        account = None
+                        num = 0
+                        for txID in transactions:
+                            await ws.send(json.dumps({"command":"tx","transaction":txID,"binary":"true"}))
+                            res = json.loads(await ws.recv())
+                            print(res)
+                            assert res["status"] == "success"
+
+                            await ws.send(json.dumps({"command":"tx","transaction":txID}))
+                            res = json.loads(await ws.recv())
+                            print(res)
+                            assert res["status"] == "success"
+                            account = res["result"]["Account"]
+                            await ws.send(json.dumps({"command":"account_info","account":account,"ledger_index":ledgerIndex}))
+                            res = json.loads(await ws.recv())
+                            print(res)
+                            if res["status"] != "success":
+                                await ws.send(json.dumps({"command":"account_info","account":account,"ledger_index":ledgerIndex-1}))
+                                res = json.loads(await ws.recv())
+                                print(res)
+                            assert res["status"] == "success"
+                            await ws.send(json.dumps({"command":"account_tx","account":account}))
+                            res = json.loads(await ws.recv())
+                            print(res)
+                            assert res["status"] == "success"
+                            assert len(res["result"]["transactions"]) > 0
+                            await ws.send(json.dumps({"command":"account_tx","account":account, "binary":"true"}))
+                            res = json.loads(await ws.recv())
+                            print(res)
+                            assert res["status"] == "success"
+                            assert len(res["result"]["transactions"]) > 0
+                            break
+
+                        print("VERIFIED LEDGER!!!!*************")
+                                
+                        return True
+                    #return await checkTransactions(ws, res["result"]["ledger"]["transactions"])
+
+                    res = await wrap(address, checkLedger)
+                   # end = ledgerIndex
+                   # for x in range(start, end):
+                   #     ledgerIndex = x
+                   #     res = await wrap(address, checkLedger)
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(e)
+        print("Websocket closed. Address = " + address)
+
+
+async def subscribeTxns(ip, port):
+    
+    address = 'ws://' + str(ip) + ':' + str(port)
+    try:
+        async with websockets.connect(address) as ws:
+            await ws.send(json.dumps({"command":"subscribe","streams":["transactions_proposed"]}))
+            while True:
+                start = int(time.time())
+                payload = json.loads(await ws.recv())
+                print(payload)
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(e)
+        print("Websocket closed. Address = " + address)
+
+
+
+async def subscribeAccounts(ip, port):
+    
+    address = 'ws://' + str(ip) + ':' + str(port)
+    try:
+        async with websockets.connect(address) as ws:
+            await ws.send(json.dumps({"command":"subscribe", "accounts_proposed":["rBW8YPFaQ8WhHUy3WyKJG3mfnTGUkuw86q","rwchA2b36zu2r6CJfEMzPLQ1cmciKFcw9t","rw2ciyaNshpHe7bCHo4bRWq6pqqynnWKQg"]}))
+            while True:
+                start = int(time.time())
+                payload = json.loads(await ws.recv())
+                print(payload)
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(e)
+        print("Websocket closed. Address = " + address)
+
+async def checkLedgers(ip, port, start, end):
+
+
+    address = 'ws://' + str(ip) + ':' + str(port)
+    print("Hello")
+    print(simple)
+
+    try:
+        async with websockets.connect(address) as ws:
+            async def checkLedger(ws, index):
+                await ws.send(json.dumps({"command":"ledger","ledger_index":index, "transactions":True}))
+                res = json.loads(await ws.recv())
+                print(res)
+                assert res["status"] == "success"
+                transactions = res["result"]["ledger"]["transactions"]
+                account = None
+                for txID in transactions:
+                    await ws.send(json.dumps({"command":"tx","transaction":txID}))
+                    res = json.loads(await ws.recv())
+                    print(res)
+                    assert res["status"] == "success"
+                    account = res["result"]["Account"]
+                    await ws.send(json.dumps({"command":"account_info","account":account,"ledger_index":index}))
+                    res = json.loads(await ws.recv())
+                    print(res)
+                    assert res["status"] == "success"
+                return True
+
+            for x in range(start,end):
+                res = await checkLedger(ws, x)
     except websockets.exceptions.ConnectionClosedError as e:
         print("Websocket closed. Address = " + address)
 
+from datetime import datetime
+async def txSpam(ip, port, index,numTxns):
+    
+    address = 'ws://' + str(ip) + ':' + str(port)
+    if index is None:
+        index = "validated"
+    else:
+        index = int(index)
+    if numTxns is None:
+        numTxns = 1000
+    else:
+        numTxns = int(numTxns)
+    try:
+        async with websockets.connect(address) as ws:
+            transactions = []
+            while len(transactions) < numTxns:
+                await ws.send(json.dumps({"command":"ledger","ledger_index":index, "transactions":True}))
+                res = json.loads(await ws.recv())
+                assert res["status"] == "success"
+                transactions.extend(res["result"]["ledger"]["transactions"])
+                index = int(res["result"]["ledger"]["ledger_index"])-1
+                print(len(transactions))
+
+            print("built list")
+
+            wss = []
+            numWs = int(numTxns / 100)
+            for x in range(0,numWs):
+                wss.append(await websockets.connect(address))
+
+            start = datetime.now()
+            count = 0
+            for txID in transactions:
+                thisWs = wss[count % 10]
+                await thisWs.send(json.dumps({"command":"tx","transaction":txID}))
+                count = count + 1
+                if count > numTxns:
+                    break
+            print("sent all")
+            count = 0
+            for txID in transactions:
+                thisWs = wss[count % 10]
+                count = count+1
+                res = json.loads(await thisWs.recv())
+                assert res["status"] == "success"
+                if count > numTxns:
+                    break
+            end = datetime.now()
+            time = (end-start).microseconds
+            assert(time > 0)
+
+            avg = numTxns / time * 1000000
+
+            print("completed " + str(numTxns) + " tx calls in " + str(time) + " microseconds")
+            print("average " + str(avg))
+    except websockets.exceptions.ConnectionClosedError as e:
+        print("Websocket closed. Address = " + address)
+
+async def accountInfoSpam(ip, port, index, numAccounts):
+    address = 'ws://' + str(ip) + ':' + str(port)
+    if index is None:
+        index = "validated"
+    else:
+        index = int(index)
+
+    if numAccounts is None:
+        numAccounts = 1000
+    else:
+        numAccounts = int(numAccounts)
+    try:
+        async with websockets.connect(address) as ws:
+            await ws.send(json.dumps({"command":"ledger_data","ledger_index":index}))
+            
+            res = json.loads(await ws.recv())
+            assert res["status"] == "success"
+            marker = res["result"]["marker"]
+            accounts = []
+            while marker is not None and len(accounts) < 1000:
+
+                await ws.send(json.dumps({"command":"ledger_data","ledger_index":index,"marker":marker}))
+                res = json.loads(await ws.recv())
+
+                
+                for record in res["result"]["state"]:
+                    if record["LedgerEntryType"] == "AccountRoot":
+                        accounts.append(record["Account"])
+                    if len(accounts) >= 1000:
+                        break
+                
+            print("got 1000 accounts!")
+
+
+            wss = []
+            numWs = int(numAccounts / 100)
+            for x in range(0,numWs):
+                wss.append(await websockets.connect(address))
+
+            start = datetime.now()
+            count = 0
+            for account in accounts:
+                thisWs = wss[count % 10]
+                await thisWs.send(json.dumps({"command":"account_info","account":account}))
+                count = count + 1
+                if count > numAccounts:
+                    break
+            print("sent all")
+            count = 0
+            for account in accounts:
+                thisWs = wss[count % 10]
+                count = count+1
+                res = json.loads(await thisWs.recv())
+                assert res["status"] == "success"
+                if count > numAccounts:
+                    break
+            end = datetime.now()
+            time = (end-start).microseconds
+            assert(time > 0)
+
+            avg = numAccounts / time * 1000000
+
+            print("completed " + str(numAccounts) + " account_info calls in " + str(time) + " microseconds")
+            print("average " + str(avg))
+    except websockets.exceptions.ConnectionClosedError as e:
+        print("Websocket closed. Address = " + address)
+
+
+async def accountTxSpam(ip, port, account):
+
+    address = 'ws://' + str(ip) + ':' + str(port)
+    request = {"command":"account_tx","account":account}
+    marker = None
+    try:
+        async with websockets.connect(address) as ws:
+            while True:
+                start = datetime.now().microsecond
+                await ws.send(json.dumps(request))
+                res = json.loads(await ws.recv())
+                assert res["status"] == "success"
+                marker = res["result"]["marker"]
+                if marker == "0":
+                    break
+                else:
+                    request["marker"] = marker;
+
+                end = datetime.now().microsecond
+
+                print(len(res["result"]["transactions"]))
+
+                print("completed account_tx in " + str(end - start) + " microseconds")
+    except websockets.exceptions.ConnectionClosedError as e:
+        print("Websocket closed. Address = " + address)
 
 async def waitForTxn(ws, txID):
     found = False
@@ -158,29 +501,30 @@ async def test_submit_and_account_tx(ip, port, account, secret, numTxns):
     tx_json["Destination"] = dest;
     
     address = 'ws://' + str(ip) + ':' + str(port)
+    print("testing submit")
     try:
         async with websockets.connect(address) as ws:
-            await ws.send(json.dumps({"command":"sign","tx_json":tx_json, "secret":secret}))
-            res = json.loads(await ws.recv())
-            print(res)
-            
-            assert res["status"] == "success"
-            assert res["forwarded"] == True
+           # await ws.send(json.dumps({"command":"sign","tx_json":tx_json, "secret":secret}))
+           # res = json.loads(await ws.recv())
+           # print(res)
+           # 
+           # assert res["status"] == "success"
+           # assert res["forwarded"] == True
 
-            blob = res["result"]["tx_blob"]
-            txID = res["result"]["tx_json"]["hash"]
-            await ws.send(json.dumps({"command":"submit","tx_blob":blob}))
-            res = json.loads(await ws.recv())
-            print(res)
-            assert res["status"] == "success"
+           # blob = res["result"]["tx_blob"]
+           # txID = res["result"]["tx_json"]["hash"]
+           # await ws.send(json.dumps({"command":"submit","tx_blob":blob}))
+           # res = json.loads(await ws.recv())
+           # print(res)
+           # assert res["status"] == "success"
 
-            await ws.send(json.dumps({"command":"sign","tx_json":tx_json, "secret":bad_secret}))
-            res = json.loads(await ws.recv())
-            print(res)
-            assert res["status"] == "error"
-            assert res["forwarded"] == True
+           # await ws.send(json.dumps({"command":"sign","tx_json":tx_json, "secret":bad_secret}))
+           # res = json.loads(await ws.recv())
+           # print(res)
+           # assert res["status"] == "error"
+           # assert res["forwarded"] == True
 
-            assert(await waitForTxn(ws, txID))
+           # assert(await waitForTxn(ws, txID))
 
             numSent = 0
             txIDs = []
@@ -291,6 +635,7 @@ async def test_submit_and_account_tx(ip, port, account, secret, numTxns):
             for seq in buckets:
                 await ws.send(json.dumps({"command":"account_tx","account":account, "ledger_index_min":seq,"ledger_index_max":seq}))
                 res = json.loads(await ws.recv())
+                print(res)
                 assert res["status"] == "success"
                 assert len(res["result"]["transactions"]) == len(buckets[seq])
 
@@ -314,6 +659,7 @@ async def test_submit_and_account_tx(ip, port, account, secret, numTxns):
             hashes = await getAllHashes(ws, account, minSeq=-1, maxSeq=-1)
             for txID in txIDs:
                 assert txID in hashes
+
             print("SUCCESS!")
     except websockets.exceptions.ConnectionClosedError as e:
         print("Websocket closed. Address = " + address)
@@ -321,39 +667,46 @@ async def test_submit_and_account_tx(ip, port, account, secret, numTxns):
 
 async def test_proxy(ip, port):
     address = 'ws://' + str(ip) + ':' + str(port)
+    print("testing proxy")
     try:
         async with websockets.connect(address) as ws:
-            await ws.send(json.dumps({"command":"ledger","ledger_index":"current"}))
-            res = json.loads(await ws.recv())
-            assert res["status"] == "success"
-            assert res["forwarded"] == True
-            assert res["result"]["validated"] == False
-            assert res["result"]["ledger"]["closed"] == False
-            assert int(res["result"]["ledger"]["ledger_index"]) > 100
-
-
-            await ws.send(json.dumps({"command":"ledger","ledger_index":"closed"}))
-            res = json.loads(await ws.recv())
-            assert res["status"] == "success"
-            assert res["forwarded"] == True
-            assert res["result"]["ledger"]["closed"] == True
-            assert int(res["result"]["ledger"]["ledger_index"]) > 100
-
-
+            # get validated
             await ws.send(json.dumps({"command":"ledger","ledger_index":"validated"}))
             res = json.loads(await ws.recv())
+            print(res)
             assert res["status"] == "success"
             assert not "forwarded" in res
             assert res["result"]["validated"] == True
             assert res["result"]["ledger"]["closed"] == True
             assert int(res["result"]["ledger"]["ledger_index"]) > 100
+            idx = int(res["result"]["ledger"]["ledger_index"])
 
+            # get current ledger
+            await ws.send(json.dumps({"command":"ledger","ledger_index":"current"}))
+            res = json.loads(await ws.recv())
+            print(res)
+            assert res["status"] == "success"
+            assert res["forwarded"] == True
+            assert res["result"]["validated"] == False
+            assert res["result"]["ledger"]["closed"] == False
+            assert int(res["result"]["ledger"]["ledger_index"]) > idx
 
-            await ws.send(json.dumps({"command":"fee"}))
+            # get closed ledger
+            await ws.send(json.dumps({"command":"ledger","ledger_index":"closed"}))
             res = json.loads(await ws.recv())
             assert res["status"] == "success"
             assert res["forwarded"] == True
-            assert int(res["result"]["ledger_current_index"]) > 100
+            assert res["result"]["ledger"]["closed"] == True
+            assert int(res["result"]["ledger"]["ledger_index"]) >= idx
+
+
+            # fee
+            await ws.send(json.dumps({"command":"fee"}))
+            res = json.loads(await ws.recv())
+            print(res)
+            assert res["status"] == "success"
+            assert res["forwarded"] == True
+            assert int(res["result"]["ledger_current_index"]) > idx
             print("SUCCESS")
     except websockets.exceptions.ConnectionClosedError as e:
         print("Websocket closed. Address = " + address)
@@ -447,7 +800,48 @@ async def test_tx(ip, port):
             
 
 
+async def tx(ip, port, hash):
+    address = 'ws://' + str(ip) + ':' + str(port)
+    try:
+        async with websockets.connect(address) as ws:
+            start = datetime.now().microsecond
+            await ws.send(json.dumps({"command":"tx","transaction":hash}))
+            res = json.loads(await ws.recv())
+            end = datetime.now().microsecond
+            print(res)
+            print("tx completed in " + str(end - start) + " microseconds")
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(e)
 
+async def account_tx(ip, port, account):
+    address = 'ws://' + str(ip) + ':' + str(port)
+    try:
+        async with websockets.connect(address) as ws:
+            start = datetime.now().microsecond
+            await ws.send(json.dumps({"command":"account_tx","account":account}))
+            res = json.loads(await ws.recv())
+            end = datetime.now().microsecond
+            print(res)
+            print("account_tx completed in " + str(end - start) + " microseconds")
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(e)
+
+async def ledger(ip, port, index):
+    address = 'ws://' + str(ip) + ':' + str(port)
+    if index is None:
+        index = "validated"
+    else:
+        index = int(index)
+    try:
+        async with websockets.connect(address) as ws:
+            start = datetime.now().microsecond
+            await ws.send(json.dumps({"command":"ledger","ledger_index":index, "transactions":True, "expand": True}))
+            res = json.loads(await ws.recv())
+            end = datetime.now().microsecond
+            print(res)
+            print("ledger completed in " + str(end - start) + " microseconds")
+    except websockets.exceptions.ConnectionClosedError as e:
+        print(e)
 
 
 
@@ -514,7 +908,7 @@ async def load_ledger_simple(txAddress, reportingAddress, ledgerSeq):
 
 
 ## Fetch data for all objects in a ledger. Send data to reporting
-async def load_data_simple(txAddress, reportingAddress, ledgerSeq):
+async def load_data_simple(txAddress, ledgerSeq):
     marker = None
     done = False
     jsonArgs = {"command":"ledger_data","ledger_index":ledgerSeq, "binary": True}
@@ -526,26 +920,22 @@ async def load_data_simple(txAddress, reportingAddress, ledgerSeq):
 
         async def getData(txWs):
             nonlocal jsonArgs
+            print("sending")
             await txWs.send(json.dumps(jsonArgs))
+            print("receiving")
             return json.loads(await txWs.recv())
 
         payload = await wrap(txAddress, getData)
+        assert res["status"] == "success"
         if 'marker' in payload['result']:
             marker = payload['result']['marker']
+            print("got marker")
         else:
             print("Done downloading data")
             marker = None
             done = True
         state = payload['result']['state']
 
-        async def sendData(reportingWs):
-            nonlocal state
-            nonlocal marker
-            print("sending data to reporting. marker = " + str(marker))
-            await reportingWs.send(json.dumps({"command": "ledger_accept",
-                "ledger_data":True,"state":state}))
-            await reportingWs.recv()
-        await wrap(reportingAddress, sendData)
 
 
 ## Send finish to reporting. Finish writes the ledger and its data to db
@@ -706,9 +1096,15 @@ async def diff_ledgers(txIp, txPort, reportingIp, reportingPort, ledgerSeq):
 
 
 
+async def test(ip, port, account, secret, numTxns):
+    await test_tx(ip, port)
+    await test_proxy(ip, port)
+    await test_submit_and_account_tx(ip, port, account, secret, numTxns)
 
 parser = argparse.ArgumentParser(description='ETL script for reporting')
-parser.add_argument('action', choices=["subscribe","diff_ledger", "tx","submit","proxy"])
+parser.add_argument('action', choices=["monitor","diff_ledger", "ledger_data","ledger", "tx","submit","proxy","test","check_range","tx_sub","account_tx","account_sub","tx_spam","account_info_spam","race"])
+parser.add_argument('--full', default="lite")
+parser.add_argument('--simple', default='False')
 parser.add_argument('--reportingIp', default='127.0.0.1')
 parser.add_argument('--reportingPort')
 parser.add_argument('--txIp', default='127.0.0.1')
@@ -717,24 +1113,68 @@ parser.add_argument('--ledgerSeq')
 parser.add_argument('--account')
 parser.add_argument('--secret')
 parser.add_argument('--numTxns')
+parser.add_argument('--num')
+parser.add_argument('--maxLag', default=10)
+parser.add_argument('--start')
+parser.add_argument('--end')
+parser.add_argument('--hash')
 
 
 args = parser.parse_args()
+maxLag = int(args.maxLag)
+simple = args.simple == "True"
+print(args.simple)
+print(simple)
+print("blajh")
 
 def run(args):
     asyncio.set_event_loop(asyncio.new_event_loop())
-    if args.action == "subscribe":
+    if args.action == "monitor":
         asyncio.get_event_loop().run_until_complete(
-                subscribe(args.reportingIp, args.reportingPort))
+                subscribe(args.reportingIp, args.reportingPort, args.ledgerSeq, args.full == "full", maxLag, simple))
+    elif args.action == "ledger_data":
+        txAddress = 'ws://' + str(args.reportingIp) + ':' + str(args.reportingPort)
+        asyncio.get_event_loop().run_until_complete(
+                load_data_simple(txAddress, args.ledgerSeq))
+    elif args.action == "race":
+        asyncio.get_event_loop().run_until_complete(
+                race(args.reportingIp, args.reportingPort))
+    elif args.action == "tx_sub":
+        asyncio.get_event_loop().run_until_complete(
+                subscribeTxns(args.reportingIp, args.reportingPort))
+    elif args.action == "account_sub":
+        asyncio.get_event_loop().run_until_complete(
+                subscribeAccounts(args.reportingIp, args.reportingPort))
+    elif args.action == "check_range":
+        asyncio.get_event_loop().run_until_complete(
+                checkLedgers(args.reportingIp, args.reportingPort, int(args.start), int(args.end)))
+    elif args.action == "tx_spam":
+        asyncio.get_event_loop().run_until_complete(
+                txSpam(args.reportingIp, args.reportingPort, args.ledgerSeq, args.num))
+    elif args.action == "account_tx2":
+        asyncio.get_event_loop().run_until_complete(
+                accountTxSpam(args.reportingIp, args.reportingPort, args.account))
+    elif args.action == "account_info_spam":
+        asyncio.get_event_loop().run_until_complete(
+                accountInfoSpam(args.reportingIp, args.reportingPort, args.ledgerSeq, args.num))
     elif args.action == "tx":
         asyncio.get_event_loop().run_until_complete(
-                test_tx(args.reportingIp, args.reportingPort))
+                tx(args.reportingIp, args.reportingPort, args.hash))
+    elif args.action == "ledger":
+        asyncio.get_event_loop().run_until_complete(
+                ledger(args.reportingIp, args.reportingPort, args.ledgerSeq))
+    elif args.action == "account_tx":
+        asyncio.get_event_loop().run_until_complete(
+                account_tx(args.reportingIp, args.reportingPort, args.account))
     elif args.action == "submit":
         asyncio.get_event_loop().run_until_complete(
             test_submit_and_account_tx(args.reportingIp, args.reportingPort, args.account, args.secret, args.numTxns))
     elif args.action == "proxy":
         asyncio.get_event_loop().run_until_complete(
             test_proxy(args.reportingIp, args.reportingPort))
+    elif args.action == "test":
+        asyncio.get_event_loop().run_until_complete(
+            test(args.reportingIp, args.reportingPort, args.account, args.secret, args.numTxns))
     elif args.action == 'diff_ledger':
         asyncio.get_event_loop().run_until_complete(
                 diff_ledgers(args.txIp, args.txPort, args.reportingIp,
